@@ -30,6 +30,7 @@ const (
 	ENV_WG_TUN_FD             = "WG_TUN_FD"
 	ENV_WG_UAPI_FD            = "WG_UAPI_FD"
 	ENV_WG_PROCESS_FOREGROUND = "WG_PROCESS_FOREGROUND"
+	ENV_WG_GRETAP             = "WG_GRETAP"
 )
 
 func printUsage() {
@@ -112,6 +113,12 @@ func main() {
 	// open TUN device (or use supplied fd)
 
 	tdev, err := func() (tun.Device, error) {
+		// GRETAP is the default TUN substitute (no tun/tap needed).
+		// Set WG_GRETAP=0 to fall back to the native /dev/net/tun path.
+		if os.Getenv(ENV_WG_GRETAP) != "0" {
+			return tun.CreateGRETap(interfaceName, device.DefaultMTU)
+		}
+
 		tunFdStr := os.Getenv(ENV_WG_TUN_FD)
 		if tunFdStr == "" {
 			return tun.CreateTUN(interfaceName, device.DefaultMTU)
