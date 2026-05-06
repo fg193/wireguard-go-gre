@@ -54,15 +54,6 @@ const (
 	// endpoint addresses.
 	greLoIface = "lo"
 
-	greLoAddrADefault = "127.0.0.3"
-	greLoAddrBDefault = "127.0.0.4"
-
-	// Env vars to override the default loopback tunnel endpoint addresses.
-	// Each wireguard-go instance must use a unique pair to avoid conflicts
-	// when running multiple instances.
-	ENV_WG_GRE_LOCAL_IP  = "WG_GRE_LOCAL_IP"
-	ENV_WG_GRE_REMOTE_IP = "WG_GRE_REMOTE_IP"
-
 	// Set WG_TUN_GRE=1 to explicitly use a GRE pair instead of /dev/net/tun.
 	ENV_WG_TUN_GRE = "WG_TUN_GRE"
 )
@@ -101,8 +92,10 @@ type GRETun struct {
 // visible to the user, so NAT traversal works as with any standard WireGuard setup.
 func CreateGRETun(nameA string, mtu int) (Device, error) {
 	nameB := nameA + greTunPeerSuffix
-	loAddrA := getLoAddr(ENV_WG_GRE_LOCAL_IP, greLoAddrADefault)
-	loAddrB := getLoAddr(ENV_WG_GRE_REMOTE_IP, greLoAddrBDefault)
+	loAddrA, loAddrB, err := pickLoAddrs()
+	if err != nil {
+		return nil, fmt.Errorf("gre: pick lo addrs: %w", err)
+	}
 
 	ifaces := []struct {
 		local   netip.Addr
@@ -183,7 +176,7 @@ func CreateGRETun(nameA string, mtu int) (Device, error) {
 	}
 
 	// Netlink monitor socket for link events on nameA.
-	nlSock, err := createNetlinkSocket()
+	nlSock, err = createNetlinkSocket()
 	if err != nil {
 		cleanup()
 		return nil, fmt.Errorf("gre: netlink socket: %w", err)
@@ -479,15 +472,105 @@ func nlLinkAddGRE(name string, local, remote netip.Addr) error {
 	)
 }
 
-// getLoAddr returns the loopback tunnel endpoint address from the given env
-// var, falling back to def if unset or invalid.
-func getLoAddr(env, def string) netip.Addr {
-	if s := os.Getenv(env); s != "" {
-		if addr, err := netip.ParseAddr(s); err == nil {
-			return addr
+// pickLoAddrs finds a free consecutive pair of loopback /32 addresses for the
+// GRE tunnel endpoints by dumping current lo addresses via RTM_GETADDR and
+// scanning 127.255.0.0/16 for an unused pair.
+func pickLoAddrs() (a, b netip.Addr, err error) {
+	used, err := nlAddrGetLo()
+	if err != nil {
+		return
+	}
+	for a = netip.AddrFrom4([4]byte{127, 255, 0, 0}); a.IsLoopback(); a = b.Next() {
+		b = a.Next()
+		if !used[a] && !used[b] {
+			return
 		}
 	}
-	return netip.MustParseAddr(def)
+	err = errors.New("gre: no free loopback address pair in 127.255.0.0/16")
+	return
+}
+
+// nlAddrGetLo returns the set of IPv4 addresses currently on lo.
+// Equivalent to: ip -4 addr show dev lo
+func nlAddrGetLo() (map[netip.Addr]bool, error) {
+	loIndex, err := getIFIndex(greLoIface)
+	if err != nil {
+		return nil, err
+	}
+
+	sock, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_ROUTE)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(sock)
+	if err = unix.Bind(sock, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
+		return nil, err
+	}
+
+	// Send RTM_GETADDR dump request.
+	ifAddr := unix.IfAddrmsg{Family: unix.AF_INET}
+	if err = nlSend(sock, unix.RTM_GETADDR, unix.NLM_F_REQUEST|unix.NLM_F_DUMP,
+		(*[unix.SizeofIfAddrmsg]byte)(unsafe.Pointer(&ifAddr))[:], nil); err != nil {
+		return nil, err
+	}
+
+	used := make(map[netip.Addr]bool)
+	reply := make([]byte, 1<<16)
+	for {
+		n, err := unix.Read(sock, reply)
+		if err != nil {
+			return nil, err
+		}
+		done, err := nlParseReply(reply[:n], loIndex, used)
+		if err != nil {
+			return nil, err
+		}
+		if done {
+			return used, nil
+		}
+	}
+}
+
+func nlParseReply(reply []byte, loIndex int32, used map[netip.Addr]bool) (done bool, err error) {
+	for remain := reply; len(remain) >= unix.SizeofNlMsghdr; {
+		hdr := *(*unix.NlMsghdr)(unsafe.Pointer(&remain[0]))
+		if int(hdr.Len) > len(remain) {
+			break
+		}
+		msg := remain[:hdr.Len]
+		remain = remain[nlAlign4(int(hdr.Len)):]
+
+		switch hdr.Type {
+		case unix.NLMSG_DONE:
+			return true, nil
+		case unix.NLMSG_ERROR:
+			if len(msg) >= unix.SizeofNlMsghdr+4 {
+				if e := *(*int32)(unsafe.Pointer(&msg[unix.SizeofNlMsghdr])); e != 0 {
+					return false, unix.Errno(-e)
+				}
+			}
+		case unix.RTM_NEWADDR:
+			if len(msg) < unix.SizeofNlMsghdr+unix.SizeofIfAddrmsg {
+				continue
+			}
+			ifa := *(*unix.IfAddrmsg)(unsafe.Pointer(&msg[unix.SizeofNlMsghdr]))
+			if int32(ifa.Index) != loIndex || ifa.Family != unix.AF_INET {
+				continue
+			}
+			for attrs := msg[unix.SizeofNlMsghdr+unix.SizeofIfAddrmsg:]; len(attrs) >= 4; {
+				alen := int(binary.NativeEndian.Uint16(attrs[0:2]))
+				if alen < 4 || alen > len(attrs) {
+					break
+				}
+				atyp := binary.NativeEndian.Uint16(attrs[2:4])
+				if (atyp == unix.IFA_LOCAL || atyp == unix.IFA_ADDRESS) && alen >= 8 {
+					used[netip.AddrFrom4([4]byte(attrs[4:8]))] = true
+				}
+				attrs = attrs[nlAlign4(alen):]
+			}
+		}
+	}
+	return false, nil
 }
 
 // nlAddrAddLo adds a /32 address to greLoIface.
@@ -589,20 +672,32 @@ func nlRuleMod(iface string, prio uint32, typ, flags uint16) error {
 
 // nlRequest sends a single NETLINK_ROUTE request and waits for ACK.
 func nlRequest(typ, flags uint16, ifInfoBuf, attrs []byte) error {
-	sock, err := unix.Socket(
-		unix.AF_NETLINK,
-		unix.SOCK_RAW|unix.SOCK_CLOEXEC,
-		unix.NETLINK_ROUTE,
-	)
+	sock, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_ROUTE)
 	if err != nil {
 		return err
 	}
 	defer unix.Close(sock)
-
 	if err = unix.Bind(sock, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
 		return err
 	}
+	if err = nlSend(sock, typ, flags, ifInfoBuf, attrs); err != nil {
+		return err
+	}
+	reply := make([]byte, os.Getpagesize())
+	for {
+		n, err := unix.Read(sock, reply)
+		if err != nil {
+			return err
+		}
+		done, err := nlParseReply(reply[:n], 0, nil)
+		if err != nil || done {
+			return err
+		}
+	}
+}
 
+// nlSend writes a single netlink message to sock.
+func nlSend(sock int, typ, flags uint16, ifInfoBuf, attrs []byte) error {
 	msgLen := unix.SizeofNlMsghdr + len(ifInfoBuf) + len(attrs)
 	msg := make([]byte, nlAlign4(msgLen))
 	hdr := (*unix.NlMsghdr)(unsafe.Pointer(&msg[0]))
@@ -612,35 +707,7 @@ func nlRequest(typ, flags uint16, ifInfoBuf, attrs []byte) error {
 	hdr.Seq = 1
 	copy(msg[unix.SizeofNlMsghdr:], ifInfoBuf)
 	copy(msg[unix.SizeofNlMsghdr+len(ifInfoBuf):], attrs)
-
-	if err = unix.Sendmsg(sock, msg, nil, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}, 0); err != nil {
-		return err
-	}
-
-	reply := make([]byte, 4096)
-	for {
-		n, err := unix.Read(sock, reply)
-		if err != nil {
-			return err
-		}
-		if n < unix.SizeofNlMsghdr {
-			return errors.New("gre: short netlink reply")
-		}
-		rh := *(*unix.NlMsghdr)(unsafe.Pointer(&reply[0]))
-		switch rh.Type {
-		case unix.NLMSG_ERROR:
-			if n < unix.SizeofNlMsghdr+4 {
-				return errors.New("gre: truncated NLMSG_ERROR")
-			}
-			errno := *(*int32)(unsafe.Pointer(&reply[unix.SizeofNlMsghdr]))
-			if errno == 0 {
-				return nil
-			}
-			return unix.Errno(-errno)
-		case unix.NLMSG_DONE:
-			return nil
-		}
-	}
+	return unix.Sendmsg(sock, msg, nil, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}, 0)
 }
 
 // nlAttr encodes a netlink attribute: 4-byte NLA header + padded data.
