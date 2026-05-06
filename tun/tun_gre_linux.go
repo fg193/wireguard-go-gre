@@ -61,16 +61,15 @@ const (
 type GRETun struct {
 	mtu    int
 	ifaces [2]greIface
-
-	// readRaw: AF_PACKET SOCK_DGRAM on <name> — captures outbound raw IP packets.
-	// RawConn wrapping ifaces[0].fd for recvfrom with sockaddr_ll (pkttype filtering).
-	readRaw syscall.RawConn
-
+	nlSock int
 	events chan Event
 
-	netlinkSock   int
-	netlinkCancel *rwcancel.RWCancel
-	shutdown      chan struct{}
+	// readFile: AF_PACKET SOCK_DGRAM on <name>, captures outbound raw IP packets.
+	// readFile.Close() deregisters from epoll, unblocking any pending Read().
+	// readRaw is the RawConn for recvfrom with sockaddr_ll (pkttype filtering).
+	readFile *os.File
+	readRaw  syscall.RawConn
+	shutdown chan struct{}
 }
 
 type greIface struct {
@@ -93,7 +92,7 @@ func CreateGRETun(name string, mtu int) (_ Device, err error) {
 			{fd: -1, name: name},
 			{fd: -1, name: name + greTunPeerSuffix},
 		},
-		netlinkSock: -1,
+		nlSock: -1,
 	}
 
 	// Clean up any stale interfaces from a previous run.
@@ -136,14 +135,11 @@ func CreateGRETun(name string, mtu int) (_ Device, err error) {
 	}
 
 	// Netlink monitor socket for link events on <name>.
-	if t.netlinkSock, err = createNetlinkSocket(); err != nil {
+	if t.nlSock, err = createNetlinkSocket(); err != nil {
 		return nil, fmt.Errorf("gre: netlink socket: %w", err)
 	}
-	if t.netlinkCancel, err = rwcancel.NewRWCancel(t.netlinkSock); err != nil {
-		return nil, fmt.Errorf("gre: rwcancel: %w", err)
-	}
-	readFile := os.NewFile(uintptr(t.ifaces[0].fd), t.ifaces[0].name)
-	if t.readRaw, err = readFile.SyscallConn(); err != nil {
+	t.readFile = os.NewFile(uintptr(t.ifaces[0].fd), t.ifaces[0].name)
+	if t.readRaw, err = t.readFile.SyscallConn(); err != nil {
 		return nil, fmt.Errorf("gre: SyscallConn: %w", err)
 	}
 
@@ -266,15 +262,20 @@ func (t *GRETun) Close() error {
 	if t.shutdown != nil {
 		close(t.shutdown)
 	}
-	if t.netlinkCancel != nil {
-		t.netlinkCancel.Close()
-	} else if t.netlinkSock >= 0 {
-		unix.Close(t.netlinkSock)
+	if t.nlSock >= 0 {
+		unix.Close(t.nlSock)
+	}
+	if t.readFile != nil {
+		if err := t.readFile.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	} else if t.ifaces[0].fd >= 0 {
+		unix.Close(t.ifaces[0].fd)
+	}
+	if t.ifaces[1].fd >= 0 {
+		unix.Close(t.ifaces[1].fd)
 	}
 	for i := range t.ifaces {
-		if t.ifaces[i].fd >= 0 {
-			unix.Close(t.ifaces[i].fd)
-		}
 		if err := nlLinkDel(t.ifaces[i].name); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -292,14 +293,11 @@ func (t *GRETun) Close() error {
 
 // routineNetlinkListener watches RTM_NEWLINK for <name> and emits EventMTUUpdate.
 func (t *GRETun) routineNetlinkListener() {
-	defer func() {
-		unix.Close(t.netlinkSock)
-		close(t.events)
-	}()
+	defer close(t.events)
 
 	buf := make([]byte, 1<<16)
 	for {
-		n, _, _, _, err := unix.Recvmsg(t.netlinkSock, buf, nil, 0)
+		n, _, _, _, err := unix.Recvmsg(t.nlSock, buf, nil, 0)
 		if err != nil {
 			select {
 			case <-t.shutdown:
@@ -307,9 +305,6 @@ func (t *GRETun) routineNetlinkListener() {
 			default:
 			}
 			if !rwcancel.RetryAfterError(err) {
-				return
-			}
-			if !t.netlinkCancel.ReadyRead() {
 				return
 			}
 			continue
