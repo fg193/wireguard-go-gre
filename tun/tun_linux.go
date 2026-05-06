@@ -234,6 +234,10 @@ func (tun *NativeTun) setMTU(n int) error {
 		return err
 	}
 
+	return setMTU(name, n)
+}
+
+func setMTU(name string, n int) error {
 	// open datagram socket
 	fd, err := unix.Socket(
 		unix.AF_INET,
@@ -549,9 +553,15 @@ func (tun *NativeTun) initFromFlags(name string) error {
 
 // CreateTUN creates a Device with the provided name and MTU.
 func CreateTUN(name string, mtu int) (Device, error) {
+	if os.Getenv(ENV_WG_TUN_GRE) == "1" {
+		return CreateGRETun(name, mtu)
+	}
+
 	nfd, err := unix.Open(cloneDevicePath, unix.O_RDWR|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// use GRE pair as fallback when TUN is not available
+			return CreateGRETun(name, mtu)
 			return nil, fmt.Errorf("CreateTUN(%q) failed; %s does not exist", name, cloneDevicePath)
 		}
 		return nil, err
