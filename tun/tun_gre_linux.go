@@ -137,6 +137,7 @@ func CreateGRETun(nameA string, mtu int) (Device, error) {
 		_ = nlLinkDel(nameB)
 		_ = nlAddrDelLo(loAddrA)
 		_ = nlAddrDelLo(loAddrB)
+		_ = nlRuleDel(nameB)
 	}
 
 	// Clean up any stale interfaces and loopback aliases from a previous run.
@@ -174,6 +175,11 @@ func CreateGRETun(nameA string, mtu int) (Device, error) {
 			return nil, fmt.Errorf("gre: AF_PACKET %s: %w", iface.name, err)
 		}
 		iface.fd = fd
+	}
+
+	if err := nlRuleAdd(nameB); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("gre: blackhole rule %s: %w", nameB, err)
 	}
 
 	// Netlink monitor socket for link events on nameA.
@@ -341,6 +347,7 @@ func (t *GRETun) Close() error {
 		}
 		_ = nlAddrDelLo(t.loAddrA)
 		_ = nlAddrDelLo(t.loAddrB)
+		_ = nlRuleDel(t.name + greTunPeerSuffix)
 	})
 	return firstErr
 }
@@ -540,6 +547,43 @@ func nlLinkDel(name string) error {
 		unix.NLM_F_REQUEST|unix.NLM_F_ACK,
 		(*[unix.SizeofIfInfomsg]byte)(unsafe.Pointer(&ifInfo))[:],
 		nil,
+	)
+}
+
+// nlRuleAdd adds a blackhole FIB rule for packets arriving on <name>_.
+// Prevents a routing loop: packets injected by Write() via <name>_ would
+// otherwise re-enter the IP stack and be re-routed back indefinitely.
+// Equivalent to: ip rule add iif <name>_ blackhole priority 100
+func nlRuleAdd(iface string) error {
+	return nlRuleMod(
+		iface, 100,
+		unix.RTM_NEWRULE,
+		unix.NLM_F_REQUEST|unix.NLM_F_ACK|unix.NLM_F_CREATE|unix.NLM_F_EXCL)
+}
+
+// nlRuleDel removes the blackhole FIB rule for <name>_.
+// Equivalent to: ip rule del iif <name>_ blackhole priority 100
+func nlRuleDel(iface string) error {
+	return nlRuleMod(
+		iface, 100,
+		unix.RTM_DELRULE,
+		unix.NLM_F_REQUEST|unix.NLM_F_ACK)
+}
+
+func nlRuleMod(iface string, prio uint32, typ, flags uint16) error {
+	rule := unix.RtMsg{
+		Family: unix.AF_INET,
+		Type:   unix.RTN_BLACKHOLE,
+		Table:  unix.RT_TABLE_UNSPEC,
+	}
+	prioBuf := [4]byte{}
+	binary.NativeEndian.PutUint32(prioBuf[:], prio)
+	prioAttr := nlAttr(unix.FRA_PRIORITY, prioBuf[:])
+	ifAttr := nlAttr(unix.FRA_IIFNAME, append([]byte(iface), 0))
+	return nlRequest(
+		typ, flags,
+		(*[unix.SizeofRtMsg]byte)(unsafe.Pointer(&rule))[:],
+		append(prioAttr, ifAttr...),
 	)
 }
 
