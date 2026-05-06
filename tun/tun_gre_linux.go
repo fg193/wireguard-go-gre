@@ -101,8 +101,8 @@ type GRETun struct {
 // visible to the user, so NAT traversal works as with any standard WireGuard setup.
 func CreateGRETun(nameA string, mtu int) (Device, error) {
 	nameB := nameA + greTunPeerSuffix
-	greLoAddrA := greGetLoAddr(ENV_WG_GRE_LOCAL_IP, greLoAddrADefault)
-	greLoAddrB := greGetLoAddr(ENV_WG_GRE_REMOTE_IP, greLoAddrBDefault)
+	loAddrA := getLoAddr(ENV_WG_GRE_LOCAL_IP, greLoAddrADefault)
+	loAddrB := getLoAddr(ENV_WG_GRE_REMOTE_IP, greLoAddrBDefault)
 
 	ifaces := []struct {
 		local   netip.Addr
@@ -111,8 +111,8 @@ func CreateGRETun(nameA string, mtu int) (Device, error) {
 		ifIndex int32
 		fd      int
 	}{
-		{local: greLoAddrA, remote: greLoAddrB, name: nameA, fd: -1},
-		{local: greLoAddrB, remote: greLoAddrA, name: nameB, fd: -1},
+		{local: loAddrA, remote: loAddrB, name: nameA, fd: -1},
+		{local: loAddrB, remote: loAddrA, name: nameB, fd: -1},
 	}
 	var (
 		nlSock   = -1
@@ -133,10 +133,10 @@ func CreateGRETun(nameA string, mtu int) (Device, error) {
 		} else if nlSock >= 0 {
 			unix.Close(nlSock)
 		}
-		_ = greNetlinkDelLink(nameA)
-		_ = greNetlinkDelLink(nameB)
-		_ = greLoAddrDel(greLoAddrA)
-		_ = greLoAddrDel(greLoAddrB)
+		_ = nlLinkDel(nameA)
+		_ = nlLinkDel(nameB)
+		_ = nlAddrDelLo(loAddrA)
+		_ = nlAddrDelLo(loAddrB)
 	}
 
 	// Clean up any stale interfaces and loopback aliases from a previous run.
@@ -146,11 +146,11 @@ func CreateGRETun(nameA string, mtu int) (Device, error) {
 	// Packets written to nameB are encapsulated and delivered inbound on nameA.
 	for i := range ifaces {
 		iface := &ifaces[i]
-		if err := greLoAddrAdd(iface.local); err != nil {
+		if err := nlAddrAddLo(iface.local); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("gre: add lo alias %s: %w", iface.local, err)
 		}
-		if err := greNetlinkAddGRE(iface.name, iface.local, iface.remote); err != nil {
+		if err := nlLinkAddGRE(iface.name, iface.local, iface.remote); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("gre: create %s: %w", iface.name, err)
 		}
@@ -158,7 +158,7 @@ func CreateGRETun(nameA string, mtu int) (Device, error) {
 			cleanup()
 			return nil, fmt.Errorf("gre: set MTU %s: %w", iface.name, err)
 		}
-		if err := greIoctlSetFlags(iface.name, unix.IFF_UP); err != nil {
+		if err := setIfUp(iface.name); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("gre: set up %s: %w", iface.name, err)
 		}
@@ -168,7 +168,7 @@ func CreateGRETun(nameA string, mtu int) (Device, error) {
 			return nil, fmt.Errorf("gre: get ifIndex %s: %w", iface.name, err)
 		}
 		iface.ifIndex = ifIndex
-		fd, err := greOpenPacketSock(ifIndex)
+		fd, err := openPacketSock(ifIndex)
 		if err != nil {
 			cleanup()
 			return nil, fmt.Errorf("gre: AF_PACKET %s: %w", iface.name, err)
@@ -199,8 +199,8 @@ func CreateGRETun(nameA string, mtu int) (Device, error) {
 		name:          nameA,
 		mtu:           mtu,
 		ifIndex:       ifaces[0].ifIndex,
-		loAddrA:       greLoAddrA,
-		loAddrB:       greLoAddrB,
+		loAddrA:       loAddrA,
+		loAddrB:       loAddrB,
 		readFile:      readFile,
 		readRaw:       readRaw,
 		writeFd:       ifaces[1].fd,
@@ -333,14 +333,14 @@ func (t *GRETun) Close() error {
 			firstErr = err
 		}
 		unix.Close(t.writeFd)
-		if err := greNetlinkDelLink(t.name); err != nil && firstErr == nil {
+		if err := nlLinkDel(t.name); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		if err := greNetlinkDelLink(t.name + greTunPeerSuffix); err != nil && firstErr == nil {
+		if err := nlLinkDel(t.name + greTunPeerSuffix); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		_ = greLoAddrDel(t.loAddrA)
-		_ = greLoAddrDel(t.loAddrB)
+		_ = nlAddrDelLo(t.loAddrA)
+		_ = nlAddrDelLo(t.loAddrB)
 	})
 	return firstErr
 }
@@ -382,7 +382,7 @@ func (t *GRETun) routineNetlinkListener() {
 				break
 			}
 			msgData := remain[:hdr.Len]
-			remain = remain[greAlign4(int(hdr.Len)):]
+			remain = remain[nlAlign4(int(hdr.Len)):]
 
 			if hdr.Type != unix.RTM_NEWLINK {
 				continue
@@ -404,7 +404,7 @@ func (t *GRETun) routineNetlinkListener() {
 
 // ── socket helpers ────────────────────────────────────────────────────────────
 
-func greOpenPacketSock(ifIndex int32) (int, error) {
+func openPacketSock(ifIndex int32) (int, error) {
 	fd, err := unix.Socket(
 		unix.AF_PACKET,
 		unix.SOCK_DGRAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK,
@@ -439,9 +439,9 @@ func htons(v uint16) uint16 {
 
 // ── netlink helpers ───────────────────────────────────────────────────────────
 
-// greNetlinkAddGRE creates a single GRE (L3) interface.
+// nlLinkAddGRE creates a single GRE (L3) interface.
 // Equivalent to: ip link add <name> type gre local <local> remote <remote>
-func greNetlinkAddGRE(name string, local, remote netip.Addr) error {
+func nlLinkAddGRE(name string, local, remote netip.Addr) error {
 	const (
 		iflaInfoKind  = 1
 		iflaInfoData  = 2
@@ -450,21 +450,21 @@ func greNetlinkAddGRE(name string, local, remote netip.Addr) error {
 	)
 	local4 := local.As4()
 	remote4 := remote.As4()
-	infoData := greNlattr(iflaInfoData,
+	infoData := nlAttr(iflaInfoData,
 		append(
-			greNlattr(iflaGreLocal, local4[:]),
-			greNlattr(iflaGreRemote, remote4[:])...,
+			nlAttr(iflaGreLocal, local4[:]),
+			nlAttr(iflaGreRemote, remote4[:])...,
 		),
 	)
-	linkInfo := greNlattr(unix.IFLA_LINKINFO,
+	linkInfo := nlAttr(unix.IFLA_LINKINFO,
 		append(
-			greNlattr(iflaInfoKind, append([]byte("gre"), 0)),
+			nlAttr(iflaInfoKind, append([]byte("gre"), 0)),
 			infoData...,
 		),
 	)
-	ifNameAttr := greNlattr(unix.IFLA_IFNAME, append([]byte(name), 0))
+	ifNameAttr := nlAttr(unix.IFLA_IFNAME, append([]byte(name), 0))
 	ifInfo := unix.IfInfomsg{Family: unix.AF_UNSPEC}
-	return greNetlinkRequest(
+	return nlRequest(
 		unix.RTM_NEWLINK,
 		unix.NLM_F_REQUEST|unix.NLM_F_CREATE|unix.NLM_F_EXCL|unix.NLM_F_ACK,
 		(*[unix.SizeofIfInfomsg]byte)(unsafe.Pointer(&ifInfo))[:],
@@ -472,9 +472,9 @@ func greNetlinkAddGRE(name string, local, remote netip.Addr) error {
 	)
 }
 
-// greGetLoAddr returns the loopback tunnel endpoint address from the given env
+// getLoAddr returns the loopback tunnel endpoint address from the given env
 // var, falling back to def if unset or invalid.
-func greGetLoAddr(env, def string) netip.Addr {
+func getLoAddr(env, def string) netip.Addr {
 	if s := os.Getenv(env); s != "" {
 		if addr, err := netip.ParseAddr(s); err == nil {
 			return addr
@@ -483,40 +483,40 @@ func greGetLoAddr(env, def string) netip.Addr {
 	return netip.MustParseAddr(def)
 }
 
-// greLoAddrAdd adds a /32 address to greLoIface.
+// nlAddrAddLo adds a /32 address to greLoIface.
 // Equivalent to: ip addr add <addr>/32 dev lo
-func greLoAddrAdd(addr netip.Addr) error {
-	return greAddrMod(
+func nlAddrAddLo(addr netip.Addr) error {
+	return nlAddrMod(
 		greLoIface, addr, 32,
 		unix.RTM_NEWADDR,
 		unix.NLM_F_REQUEST|unix.NLM_F_ACK|unix.NLM_F_CREATE|unix.NLM_F_EXCL)
 }
 
-// greLoAddrDel removes a /32 address from greLoIface.
+// nlAddrDelLo removes a /32 address from greLoIface.
 // Equivalent to: ip addr del <addr>/32 dev lo
-func greLoAddrDel(addr netip.Addr) error {
-	return greAddrMod(
+func nlAddrDelLo(addr netip.Addr) error {
+	return nlAddrMod(
 		greLoIface, addr, 32,
 		unix.RTM_DELADDR,
 		unix.NLM_F_REQUEST|unix.NLM_F_ACK)
 }
 
-func greAddrMod(iface string, addr netip.Addr, prefixLen uint8, typ, flags uint16) error {
+func nlAddrMod(iface string, addr netip.Addr, prefixLen uint8, typ, flags uint16) error {
 	ifIndex, err := getIFIndex(iface)
 	if err != nil {
 		return err
 	}
 	addr4 := addr.As4()
 	addrAttr := append(
-		greNlattr(unix.IFA_ADDRESS, addr4[:]),
-		greNlattr(unix.IFA_LOCAL, addr4[:])...,
+		nlAttr(unix.IFA_ADDRESS, addr4[:]),
+		nlAttr(unix.IFA_LOCAL, addr4[:])...,
 	)
 	ifAddr := unix.IfAddrmsg{
 		Family:    unix.AF_INET,
 		Prefixlen: prefixLen,
 		Index:     uint32(ifIndex),
 	}
-	return greNetlinkRequest(
+	return nlRequest(
 		typ,
 		flags,
 		(*[unix.SizeofIfAddrmsg]byte)(unsafe.Pointer(&ifAddr))[:],
@@ -524,8 +524,9 @@ func greAddrMod(iface string, addr netip.Addr, prefixLen uint8, typ, flags uint1
 	)
 }
 
-// greNetlinkDelLink issues RTM_DELLINK to remove the named interface.
-func greNetlinkDelLink(name string) error {
+// nlLinkDel removes an interface.
+// Equivalent to: ip link del <name>
+func nlLinkDel(name string) error {
 	ifIndex, err := getIFIndex(name)
 	if err != nil {
 		return err
@@ -534,7 +535,7 @@ func greNetlinkDelLink(name string) error {
 		Family: unix.AF_UNSPEC,
 		Index:  ifIndex,
 	}
-	return greNetlinkRequest(
+	return nlRequest(
 		unix.RTM_DELLINK,
 		unix.NLM_F_REQUEST|unix.NLM_F_ACK,
 		(*[unix.SizeofIfInfomsg]byte)(unsafe.Pointer(&ifInfo))[:],
@@ -542,8 +543,8 @@ func greNetlinkDelLink(name string) error {
 	)
 }
 
-// greNetlinkRequest sends a single NETLINK_ROUTE request and waits for ACK.
-func greNetlinkRequest(typ, flags uint16, ifInfoBuf, attrs []byte) error {
+// nlRequest sends a single NETLINK_ROUTE request and waits for ACK.
+func nlRequest(typ, flags uint16, ifInfoBuf, attrs []byte) error {
 	sock, err := unix.Socket(
 		unix.AF_NETLINK,
 		unix.SOCK_RAW|unix.SOCK_CLOEXEC,
@@ -559,7 +560,7 @@ func greNetlinkRequest(typ, flags uint16, ifInfoBuf, attrs []byte) error {
 	}
 
 	msgLen := unix.SizeofNlMsghdr + len(ifInfoBuf) + len(attrs)
-	msg := make([]byte, greAlign4(msgLen))
+	msg := make([]byte, nlAlign4(msgLen))
 	hdr := (*unix.NlMsghdr)(unsafe.Pointer(&msg[0]))
 	hdr.Len = uint32(msgLen)
 	hdr.Type = typ
@@ -598,22 +599,24 @@ func greNetlinkRequest(typ, flags uint16, ifInfoBuf, attrs []byte) error {
 	}
 }
 
-// greNlattr encodes a netlink attribute: 4-byte NLA header + padded data.
-func greNlattr(typ int, data []byte) []byte {
+// nlAttr encodes a netlink attribute: 4-byte NLA header + padded data.
+func nlAttr(typ int, data []byte) []byte {
 	l := 4 + len(data)
-	b := make([]byte, greAlign4(l))
+	b := make([]byte, nlAlign4(l))
 	binary.NativeEndian.PutUint16(b[0:2], uint16(l))
 	binary.NativeEndian.PutUint16(b[2:4], uint16(typ))
 	copy(b[4:], data)
 	return b
 }
 
-// greAlign4 rounds n up to the nearest 4-byte boundary.
-func greAlign4(n int) int {
+// nlAlign4 rounds n up to the nearest 4-byte boundary.
+func nlAlign4(n int) int {
 	return (n + 3) &^ 3
 }
 
-func greIoctlSetFlags(name string, set uint16) error {
+// setIfUp brings an interface up.
+// Equivalent to: ip link set <name> up
+func setIfUp(name string) error {
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return err
@@ -625,7 +628,9 @@ func greIoctlSetFlags(name string, set uint16) error {
 		uintptr(unix.SIOCGIFFLAGS), uintptr(unsafe.Pointer(&ifr[0]))); errno != 0 {
 		return errno
 	}
-	*(*uint16)(unsafe.Pointer(&ifr[unix.IFNAMSIZ])) |= set
+
+	*(*uint16)(unsafe.Pointer(&ifr[unix.IFNAMSIZ])) |= unix.IFF_UP
+
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd),
 		uintptr(unix.SIOCSIFFLAGS), uintptr(unsafe.Pointer(&ifr[0]))); errno != 0 {
 		return errno
