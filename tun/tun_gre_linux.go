@@ -36,7 +36,6 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
-	"sync"
 	"syscall"
 	"unsafe"
 
@@ -60,156 +59,96 @@ const (
 
 // GRETun implements tun.Device using a GRE pair as the inner TUN substitute.
 type GRETun struct {
-	name    string
-	mtu     int
-	ifIndex int32 // ifIndex of <name> (the read side)
-	loAddrA netip.Addr
-	loAddrB netip.Addr
+	mtu    int
+	ifaces [2]greIface
 
-	// readFile: AF_PACKET SOCK_DGRAM on <name> — captures outbound raw IP packets.
-	// readRaw is the RawConn for recvfrom with sockaddr_ll (pkttype filtering).
-	readFile *os.File
-	readRaw  syscall.RawConn
-
-	// writeFd: AF_PACKET SOCK_DGRAM on <name>_ — injects raw IP packets inbound.
-	writeFd      int
-	writeIfIndex int32
+	// readRaw: AF_PACKET SOCK_DGRAM on <name> — captures outbound raw IP packets.
+	// RawConn wrapping ifaces[0].fd for recvfrom with sockaddr_ll (pkttype filtering).
+	readRaw syscall.RawConn
 
 	events chan Event
 
 	netlinkSock   int
 	netlinkCancel *rwcancel.RWCancel
+	shutdown      chan struct{}
+}
 
-	shutdown  chan struct{}
-	closeOnce sync.Once
+type greIface struct {
+	name    string
+	ifIndex int32
+	loAddr  netip.Addr
+	fd      int
 }
 
 // CreateGRETun creates a mirrored GRE pair as a TUN substitute:
-// - A: <name>  local=$WG_GRE_LOCAL_IP  remote=$WG_GRE_REMOTE_IP  (Read side — assign WG IP here)
-// - B: <name>_ local=$WG_GRE_REMOTE_IP remote=$WG_GRE_LOCAL_IP   (Write side — inject packets here)
+// ip link add 0.name type gre local 0.loAddr remote 1.loAddr (Read side, assign WG IP here)
+// ip link add 1.name type gre local 1.loAddr remote 0.loAddr (Write side, inject packets here)
 //
 // WireGuard's encrypted UDP uses the normal routing table; no outer GRE link is
 // visible to the user, so NAT traversal works as with any standard WireGuard setup.
-func CreateGRETun(nameA string, mtu int) (Device, error) {
-	nameB := nameA + greTunPeerSuffix
-	loAddrA, loAddrB, err := pickLoAddrs()
-	if err != nil {
-		return nil, fmt.Errorf("gre: pick lo addrs: %w", err)
+func CreateGRETun(name string, mtu int) (_ Device, err error) {
+	t := &GRETun{
+		mtu: mtu,
+		ifaces: [2]greIface{
+			{fd: -1, name: name},
+			{fd: -1, name: name + greTunPeerSuffix},
+		},
+		netlinkSock: -1,
 	}
 
-	ifaces := []struct {
-		local   netip.Addr
-		remote  netip.Addr
-		name    string
-		ifIndex int32
-		fd      int
-	}{
-		{local: loAddrA, remote: loAddrB, name: nameA, fd: -1},
-		{local: loAddrB, remote: loAddrA, name: nameB, fd: -1},
-	}
-	var (
-		nlSock   = -1
-		nlCancel *rwcancel.RWCancel
-		readFile *os.File
-	)
-	cleanup := func() {
-		if readFile != nil {
-			readFile.Close()
-		} else if ifaces[0].fd >= 0 {
-			unix.Close(ifaces[0].fd)
+	// Clean up any stale interfaces from a previous run.
+	t.Close()
+
+	defer func() {
+		if err != nil {
+			t.Close()
 		}
-		if ifaces[1].fd >= 0 {
-			unix.Close(ifaces[1].fd)
-		}
-		if nlCancel != nil {
-			nlCancel.Close()
-		} else if nlSock >= 0 {
-			unix.Close(nlSock)
-		}
-		_ = nlLinkDel(nameA)
-		_ = nlLinkDel(nameB)
-		_ = nlAddrDelLo(loAddrA)
-		_ = nlAddrDelLo(loAddrB)
-		_ = nlRuleDel(nameB)
+	}()
+
+	if err = nlAddrAddLoPair(t); err != nil {
+		return nil, fmt.Errorf("gre: claim lo addr pair: %w", err)
 	}
 
-	// Clean up any stale interfaces and loopback aliases from a previous run.
-	cleanup()
-
-	// Add loopback aliases and create each GRE interface.
-	// Packets written to nameB are encapsulated and delivered inbound on nameA.
-	for i := range ifaces {
-		iface := &ifaces[i]
-		if err := nlAddrAddLo(iface.local); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("gre: add lo alias %s: %w", iface.local, err)
-		}
-		if err := nlLinkAddGRE(iface.name, iface.local, iface.remote); err != nil {
-			cleanup()
+	// Create the GRE interfaces.
+	// Packets written to <name>_ are encapsulated and delivered inbound on <name>.
+	// Addresses are mirrored: each side's remote is the other's local.
+	for i := range t.ifaces {
+		iface := &t.ifaces[i]
+		if err = nlLinkAddGRE(iface.name, iface.loAddr, t.ifaces[1-i].loAddr); err != nil {
 			return nil, fmt.Errorf("gre: create %s: %w", iface.name, err)
 		}
-		if err := setMTU(iface.name, mtu); err != nil {
-			cleanup()
+		if err = setMTU(iface.name, mtu); err != nil {
 			return nil, fmt.Errorf("gre: set MTU %s: %w", iface.name, err)
 		}
-		if err := setIfUp(iface.name); err != nil {
-			cleanup()
+		if err = setIfUp(iface.name); err != nil {
 			return nil, fmt.Errorf("gre: set up %s: %w", iface.name, err)
 		}
-		ifIndex, err := getIFIndex(iface.name)
-		if err != nil {
-			cleanup()
+		if iface.ifIndex, err = getIFIndex(iface.name); err != nil {
 			return nil, fmt.Errorf("gre: get ifIndex %s: %w", iface.name, err)
 		}
-		iface.ifIndex = ifIndex
-		fd, err := openPacketSock(ifIndex)
-		if err != nil {
-			cleanup()
+		if iface.fd, err = openPacketSock(iface.ifIndex); err != nil {
 			return nil, fmt.Errorf("gre: AF_PACKET %s: %w", iface.name, err)
 		}
-		iface.fd = fd
 	}
 
-	if err := nlRuleAdd(nameB); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("gre: blackhole rule %s: %w", nameB, err)
+	if err = nlRuleAdd(t.ifaces[1].name); err != nil {
+		return nil, fmt.Errorf("gre: blackhole rule %s: %w", t.ifaces[1].name, err)
 	}
 
-	// Netlink monitor socket for link events on nameA.
-	nlSock, err = createNetlinkSocket()
-	if err != nil {
-		cleanup()
+	// Netlink monitor socket for link events on <name>.
+	if t.netlinkSock, err = createNetlinkSocket(); err != nil {
 		return nil, fmt.Errorf("gre: netlink socket: %w", err)
 	}
-	nlCancel, err = rwcancel.NewRWCancel(nlSock)
-	if err != nil {
-		cleanup()
+	if t.netlinkCancel, err = rwcancel.NewRWCancel(t.netlinkSock); err != nil {
 		return nil, fmt.Errorf("gre: rwcancel: %w", err)
 	}
-
-	readFile = os.NewFile(uintptr(ifaces[0].fd), nameA)
-	readRaw, err := readFile.SyscallConn()
-	if err != nil {
-		cleanup()
+	readFile := os.NewFile(uintptr(t.ifaces[0].fd), t.ifaces[0].name)
+	if t.readRaw, err = readFile.SyscallConn(); err != nil {
 		return nil, fmt.Errorf("gre: SyscallConn: %w", err)
 	}
 
-	t := &GRETun{
-		name:          nameA,
-		mtu:           mtu,
-		ifIndex:       ifaces[0].ifIndex,
-		loAddrA:       loAddrA,
-		loAddrB:       loAddrB,
-		readFile:      readFile,
-		readRaw:       readRaw,
-		writeFd:       ifaces[1].fd,
-		writeIfIndex:  ifaces[1].ifIndex,
-		events:        make(chan Event, 5),
-		netlinkSock:   nlSock,
-		netlinkCancel: nlCancel,
-		shutdown:      make(chan struct{}),
-	}
-
+	t.shutdown = make(chan struct{})
+	t.events = make(chan Event, 5)
 	t.events <- EventUp
 	go t.routineNetlinkListener()
 	return t, nil
@@ -287,7 +226,7 @@ func (t *GRETun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 func (t *GRETun) Write(bufs [][]byte, offset int) (int, error) {
 	sll := unix.RawSockaddrLinklayer{
 		Family:  unix.AF_PACKET,
-		Ifindex: t.writeIfIndex,
+		Ifindex: t.ifaces[1].ifIndex,
 	}
 
 	for i, buf := range bufs {
@@ -302,7 +241,7 @@ func (t *GRETun) Write(bufs [][]byte, offset int) (int, error) {
 		}
 		if _, _, errno := unix.Syscall6(
 			unix.SYS_SENDTO,
-			uintptr(t.writeFd),
+			uintptr(t.ifaces[1].fd),
 			uintptr(unsafe.Pointer(&pkt[0])),
 			uintptr(len(pkt)),
 			0,
@@ -315,33 +254,39 @@ func (t *GRETun) Write(bufs [][]byte, offset int) (int, error) {
 	return len(bufs), nil
 }
 
-func (t *GRETun) MTU() (int, error) { return t.mtu, nil }
-
 // Name returns the user-facing GRE interface name (<name>), which holds the
 // WireGuard IP address and is the name wireguard-go advertises via UAPI.
-func (t *GRETun) Name() (string, error) { return t.name, nil }
+func (t *GRETun) Name() (string, error) { return t.ifaces[0].name, nil }
 func (t *GRETun) Events() <-chan Event  { return t.events }
+func (t *GRETun) MTU() (int, error)     { return t.mtu, nil }
 func (t *GRETun) BatchSize() int        { return 1 }
 
 func (t *GRETun) Close() error {
 	var firstErr error
-	t.closeOnce.Do(func() {
+	if t.shutdown != nil {
 		close(t.shutdown)
+	}
+	if t.netlinkCancel != nil {
 		t.netlinkCancel.Close()
-		if err := t.readFile.Close(); err != nil && firstErr == nil {
+	} else if t.netlinkSock >= 0 {
+		unix.Close(t.netlinkSock)
+	}
+	for i := range t.ifaces {
+		if t.ifaces[i].fd >= 0 {
+			unix.Close(t.ifaces[i].fd)
+		}
+		if err := nlLinkDel(t.ifaces[i].name); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		unix.Close(t.writeFd)
-		if err := nlLinkDel(t.name); err != nil && firstErr == nil {
-			firstErr = err
+		if t.ifaces[i].loAddr.IsValid() {
+			if err := nlAddrDelLo(t.ifaces[i].loAddr); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
-		if err := nlLinkDel(t.name + greTunPeerSuffix); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		_ = nlAddrDelLo(t.loAddrA)
-		_ = nlAddrDelLo(t.loAddrB)
-		_ = nlRuleDel(t.name + greTunPeerSuffix)
-	})
+	}
+	if err := nlRuleDel(t.ifaces[1].name); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	return firstErr
 }
 
@@ -391,7 +336,7 @@ func (t *GRETun) routineNetlinkListener() {
 				continue
 			}
 			info := *(*unix.IfInfomsg)(unsafe.Pointer(&msgData[unix.SizeofNlMsghdr]))
-			if info.Index != t.ifIndex {
+			if info.Index != t.ifaces[0].ifIndex {
 				continue
 			}
 			select {
@@ -472,22 +417,34 @@ func nlLinkAddGRE(name string, local, remote netip.Addr) error {
 	)
 }
 
-// pickLoAddrs finds a free consecutive pair of loopback /32 addresses for the
-// GRE tunnel endpoints by dumping current lo addresses via RTM_GETADDR and
-// scanning 127.255.0.0/16 for an unused pair.
-func pickLoAddrs() (a, b netip.Addr, err error) {
+// nlAddrAddLoPair claims two free loopback /32 addresses from 127.255.0.0/16
+// using a single RTM_GETADDR scan. Each address is added with NLM_F_EXCL;
+// EEXIST means another instance raced us — skip to the next candidate.
+// On success both addresses have been added to lo; the caller must remove
+// them on cleanup.
+func nlAddrAddLoPair(t *GRETun) error {
 	used, err := nlAddrGetLo()
 	if err != nil {
-		return
+		return err
 	}
-	for a = netip.AddrFrom4([4]byte{127, 255, 0, 0}); a.IsLoopback(); a = b.Next() {
-		b = a.Next()
-		if !used[a] && !used[b] {
-			return
+
+	for i, addr := 0, netip.AddrFrom4([4]byte{127, 255, 0, 0}); i < len(t.ifaces) && addr.IsLoopback(); addr = addr.Next() {
+		if used[addr] {
+			continue
 		}
+		if err = nlAddrAddLo(addr); err == unix.EEXIST {
+			continue
+		} else if err != nil {
+			return err
+		}
+		t.ifaces[i].loAddr = addr
+		i++
 	}
-	err = errors.New("gre: no free loopback address pair in 127.255.0.0/16")
-	return
+
+	if t.ifaces[1].loAddr.IsValid() {
+		return nil
+	}
+	return errors.New("gre: no free loopback address pair in 127.255.0.0/16")
 }
 
 // nlAddrGetLo returns the set of IPv4 addresses currently on lo.
@@ -544,11 +501,13 @@ func nlParseReply(reply []byte, loIndex int32, used map[netip.Addr]bool) (done b
 		case unix.NLMSG_DONE:
 			return true, nil
 		case unix.NLMSG_ERROR:
-			if len(msg) >= unix.SizeofNlMsghdr+4 {
-				if e := *(*int32)(unsafe.Pointer(&msg[unix.SizeofNlMsghdr])); e != 0 {
-					return false, unix.Errno(-e)
-				}
+			if len(msg) < unix.SizeofNlMsghdr+4 {
+				return false, errors.New("gre: truncated NLMSG_ERROR")
 			}
+			if e := *(*int32)(unsafe.Pointer(&msg[unix.SizeofNlMsghdr])); e != 0 {
+				return false, unix.Errno(-e)
+			}
+			return true, nil
 		case unix.RTM_NEWADDR:
 			if len(msg) < unix.SizeofNlMsghdr+unix.SizeofIfAddrmsg {
 				continue
