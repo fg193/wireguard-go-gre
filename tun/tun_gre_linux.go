@@ -122,6 +122,9 @@ func CreateGRETun(name string, mtu int) (_ Device, err error) {
 		if err = setIfUp(iface.name); err != nil {
 			return nil, fmt.Errorf("gre: set up %s: %w", iface.name, err)
 		}
+		if err = setTxChecksumOff(iface.name); err != nil {
+			return nil, fmt.Errorf("gre: tx csum off %s: %w", iface.name, err)
+		}
 		if iface.ifIndex, err = getIFIndex(iface.name); err != nil {
 			return nil, fmt.Errorf("gre: get ifIndex %s: %w", iface.name, err)
 		}
@@ -358,12 +361,8 @@ func openPacketSock(ifIndex int32) (int, error) {
 		Protocol: htons(unix.ETH_P_ALL),
 		Ifindex:  ifIndex,
 	}
-	if _, _, errno := unix.Syscall(
-		unix.SYS_BIND,
-		uintptr(fd),
-		uintptr(unsafe.Pointer(&sll)),
-		unsafe.Sizeof(sll),
-	); errno != 0 {
+	if _, _, errno := unix.Syscall(unix.SYS_BIND, uintptr(fd),
+		uintptr(unsafe.Pointer(&sll)), unsafe.Sizeof(sll)); errno != 0 {
 		unix.Close(fd)
 		return -1, errno
 	}
@@ -698,6 +697,38 @@ func setIfUp(name string) error {
 
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd),
 		uintptr(unix.SIOCSIFFLAGS), uintptr(unsafe.Pointer(&ifr[0]))); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// setTxChecksumOff disables TX checksum offload on the interface.
+// GRE interfaces are virtual and never complete partial (CHECKSUM_PARTIAL)
+// checksums set by the kernel for TX offload. Packets captured by Read()
+// with partial checksums are forwarded as-is by the remote peer, causing
+// silent drops at the destination. Disabling TX checksum offload forces
+// the kernel to compute full checksums before packets reach Read(), ensuring
+// forwarded packets have valid checksums.
+// Equivalent to: ethtool -K <name> tx off
+func setTxChecksumOff(name string) error {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+
+	var ifr [ifReqSize]byte
+	copy(ifr[:], name)
+
+	// ethtool_value: cmd (uint32) + data (uint32)
+	val := [8]byte{}
+	binary.NativeEndian.PutUint32(val[0:4], unix.ETHTOOL_STXCSUM)
+	binary.NativeEndian.PutUint32(val[4:8], 0) // 0 = off
+
+	*(*uintptr)(unsafe.Pointer(&ifr[unix.IFNAMSIZ])) = uintptr(unsafe.Pointer(&val[0]))
+
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd),
+		uintptr(unix.SIOCETHTOOL), uintptr(unsafe.Pointer(&ifr[0]))); errno != 0 {
 		return errno
 	}
 	return nil
